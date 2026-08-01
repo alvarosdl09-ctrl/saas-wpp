@@ -35,7 +35,7 @@ async function connectWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 
     // ==========================================
-    // O OUVINTE DE MENSAGENS (O Cérebro do Bot)
+    // O OUVINTE DE MENSAGENS INTELIGENTE
     // ==========================================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
@@ -45,9 +45,8 @@ async function connectWhatsApp() {
         // Ignora mensagens enviadas pelo próprio bot/número
         if (!msg.message || msg.key.fromMe) return;
 
-        const remoteJid = msg.key.remoteJid; // Número de quem mandou a mensagem
+        const remoteJid = msg.key.remoteJid;
         
-        // Pega o texto da mensagem (seja texto normal ou botão)
         const messageText = msg.message.conversation || 
                             msg.message.extendedTextMessage?.text;
 
@@ -57,8 +56,17 @@ async function connectWhatsApp() {
 
         const textoLimpo = messageText.toLowerCase().trim();
 
-        // Respostas automáticas iniciais de teste
-        if (textoLimpo === 'olá' || textoLimpo === 'oi' || textoLimpo === 'menu') {
+        // Lista completa de saudações e gírias aceitas
+        const saudacoes = [
+            'oi', 'olá', 'ola', 'menu', 'coé', 'coe', 'salve', 
+            'e aí', 'e ai', 'fala', 'beleza', 'beleza?', 'fala aí', 
+            'bom dia', 'boa tarde', 'boa noite', 'hey', 'hi', 'hello', 'inicio'
+        ];
+
+        // Verifica se a mensagem enviada está na nossa lista de cumprimentos
+        const ehSaudacao = saudacoes.some(girling => textoLimpo.includes(girling));
+
+        if (ehSaudacao) {
             await sock.sendMessage(remoteJid, { 
                 text: '👋 Olá! Seja bem-vindo ao nosso sistema de atendimento automatizado.\n\nComo posso te ajudar hoje?\n1️⃣ Ver horários disponíveis\n2️⃣ Falar com atendente' 
             });
