@@ -1,9 +1,68 @@
 const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
 const { usePostgresAuthState } = require('./postgresAuthState');
+const { Pool } = require('pg');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 
+// Conexão com o Banco Neon (São Paulo)
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+// Inicialização do Banco: Cria tabelas e insere dados padrão se não existirem
+async function inicializarBanco() {
+    try {
+        // Tabela de Estados da Conversa (State Machine)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cliente_estado (
+                telefone VARCHAR(50) PRIMARY KEY,
+                etapa VARCHAR(50) NOT NULL,
+                dado_temporario TEXT
+            );
+        `);
+
+        // Tabela de Serviços Dinâmicos
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS servicos (
+                id SERIAL PRIMARY KEY,
+                nome VARCHAR(100) NOT NULL,
+                preco NUMERIC(10, 2) NOT NULL
+            );
+        `);
+
+        // Tabela de Agendamentos Reais
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS agendamentos (
+                id SERIAL PRIMARY KEY,
+                cliente_telefone VARCHAR(50) NOT NULL,
+                servico_id INT NOT NULL,
+                data_hora VARCHAR(50) NOT NULL,
+                criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // Popular serviços iniciais caso a tabela esteja vazia
+        const resServicos = await pool.query('SELECT COUNT(*) FROM servicos');
+        if (parseInt(resServicos.rows[0].count) === 0) {
+            await pool.query(`
+                INSERT INTO servicos (nome, preco) VALUES 
+                ('Corte de Cabelo', 40.00),
+                ('Barba', 30.00),
+                ('Corte + Barba', 60.00);
+            `);
+            console.log('Serviços padrão inseridos no banco com sucesso!');
+        }
+
+        console.log('Banco de dados estruturado no padrão de mercado!');
+    } catch (err) {
+        console.error('Erro ao inicializar o banco de dados:', err);
+    }
+}
+
 async function connectWhatsApp() {
+    await inicializarBanco();
+
     const { state, saveCreds } = await usePostgresAuthState();
 
     const sock = makeWASocket({
@@ -11,7 +70,6 @@ async function connectWhatsApp() {
         logger: pino({ level: 'silent' })
     });
 
-    // Evento de Conexão e QR Code
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -27,60 +85,287 @@ async function connectWhatsApp() {
                 connectWhatsApp();
             }
         } else if (connection === 'open') {
-            console.log('WhatsApp conectado com sucesso e salvo no banco Neon!');
+            console.log('WhatsApp conectado e operando no padrão profissional!');
         }
     });
 
-    // Salvar credenciais de autenticação
     sock.ev.on('creds.update', saveCreds);
 
     // ==========================================
-    // O OUVINTE DE MENSAGENS INTELIGENTE
+    // OUVINTE COM MÁQUINA DE ESTADO E BANCO DINÂMICO
     // ==========================================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
         const msg = messages[0];
-        
-        // Ignora mensagens enviadas pelo próprio bot/número
         if (!msg.message || msg.key.fromMe) return;
 
         const remoteJid = msg.key.remoteJid;
-        
         const messageText = msg.message.conversation || 
                             msg.message.extendedTextMessage?.text;
 
         if (!messageText) return;
 
-        console.log(`Mensagem recebida de ${remoteJid}: ${messageText}`);
-
         const textoLimpo = messageText.toLowerCase().trim();
+        console.log(`Mensagem de ${remoteJid}: ${textoLimpo}`);
 
-        // Lista completa de saudações e gírias aceitas
-        const saudacoes = [
-            'oi', 'olá', 'ola', 'menu', 'coé', 'coe', 'salve', 
-            'e aí', 'e ai', 'fala', 'beleza', 'beleza?', 'fala aí', 
-            'bom dia', 'boa tarde', 'boa noite', 'hey', 'hi', 'hello', 'inicio'
-        ];
+        try {
+            // 1. Buscar estado atual do cliente no banco
+            let resEstado = await pool.query('SELECT etapa, dado_temporario FROM cliente_estado WHERE telefone = $1', [remoteJid]);
+            let etapaAtual = resEstado.rows.length > 0 ? resEstado.rows[0].etapa : 'INICIO';
+            let dadoTemp = resEstado.rows.length > 0 ? resEstado.rows[0].dado_temporario : null;
 
-        // Verifica se a mensagem enviada está na nossa lista de cumprimentos
-        const ehSaudacao = saudacoes.some(girling => textoLimpo.includes(girling));
+            // 2. Tratar comando de reset / saudação / menu a qualquer momento
+            const saudacoes = ['oi', 'olá', 'ola', 'menu', 'coé', 'coe', 'salve', 'e aí', 'e ai', 'fala', 'inicio'];
+            const ehSaudacao = saudacoes.some(girling => textoLimpo.includes(girling));
 
-        if (ehSaudacao) {
-            await sock.sendMessage(remoteJid, { 
-                text: '👋 Olá! Seja bem-vindo ao nosso sistema de atendimento automatizado.\n\nComo posso te ajudar hoje?\n1️⃣ Ver horários disponíveis\n2️⃣ Falar com atendente' 
-            });
-        } else if (textoLimpo === '1') {
-            await sock.sendMessage(remoteJid, { 
-                text: '📅 Aqui estão os horários disponíveis para hoje:\n- 14:00\n- 15:30\n- 17:00\n\nResponda com o horário desejado.' 
-            });
-        } else {
-            await sock.sendMessage(remoteJid, { 
-                text: 'Recebi sua mensagem! Em breve nosso sistema de agendamento completo estará respondendo por aqui.' 
-            });
+            if (ehSaudacao || textoLimpo === 'menu') {
+                etapaAtual = 'MENU_PRINCIPAL';
+                await pool.query(`
+                    INSERT INTO cliente_estado (telefone, etapa, dado_temporario) 
+                    VALUES ($1, $2, NULL) 
+                    ON CONFLICT (telefone) DO UPDATE SET etapa = $2, dado_temporario = NULL;
+                `, [remoteJid, etapaAtual]);
+
+                await sock.sendMessage(remoteJid, { 
+                    text: '💈 *Sistema de Atendimento Inteligente*\n\nSeja bem-vindo! Como podemos ajudar?\n\n1️⃣ Ver Serviços e Agendar\n2️⃣ Falar com Atendente' 
+                });
+                return;
+            }
+
+            // 3. Máquina de Estados (Fluxo Direcional)
+            if (etapaAtual === 'MENU_PRINCIPAL') {
+                if (textoLimpo === '1') {
+                    // Buscar serviços dinamicamente do banco de dados PostgreSQL
+                    const servicosRes = await pool.query('SELECT id, nome, preco FROM servicos ORDER BY id ASC');
+                    
+                    let textoServicos = '✂️ *Escolha o serviço desejado digitando o número:*\n\n';
+                    servicosRes.rows.forEach(s => {
+                        textoServicos += `${s.id}️⃣ ${s.nome} - R$ ${Number(s.preco).toFixed(2)}\n`;
+                    });
+
+                    etapaAtual = 'ESCOLHENDO_SERVICO';
+                    await pool.query('UPDATE cliente_estado SET etapa = $1 WHERE telefone = $2', [etapaAtual, remoteJid]);
+
+                    await sock.sendMessage(remoteJid, { text: textoServicos });
+                } else if (textoLimpo === '2') {
+                    await sock.sendMessage(remoteJid, { 
+                        text: '📞 Um de nossos atendentes foi chamado e responderá em breve por aqui.' 
+                    });
+                    // Reseta estado
+                    await pool.query('DELETE FROM cliente_estado WHERE telefone = $1', [remoteJid]);
+                } else {
+                    await sock.sendMessage(remoteJid, { text: '⚠️ Opção inválida. Digite *1* para ver os serviços ou *2* para falar com atendente.' });
+                }
+            } 
+            else if (etapaAtual === 'ESCOLHENDO_SERVICO') {
+                const servicoId = parseInt(textoLimpo);
+                
+                // Valida se o serviço existe no banco
+                const servicoRes = await pool.query('SELECT * FROM servicos WHERE id = $1', [servicoId]);
+
+                if (servicoRes.rows.length > 0) {
+                    const servicoEscolhido = servicoRes.rows.name || servicoRes.rows[0].nome;
+                    const horarioFixo = 'Hoje às 17:00'; // Em evolução futura, aqui listaria horários livres
+
+                    // Salva o agendamento de verdade no banco relacional
+                    await pool.query(
+                        'INSERT INTO agendamentos (cliente_telefone, servico_id, data_hora) VALUES ($1, $2, $3)',
+                        [remoteJid, servicoId, horarioFixo]
+                    );
+
+                    await sock.sendMessage(remoteJid, { 
+                        text: `✅ *Agendamento Confirmado com Sucesso!*\n\nServiço: ${servicoEscolhido}\nHorário: ${horarioFixo}\n\nObrigado por agendar conosco!` 
+                    });
+
+                    // Limpa o estado do cliente após concluir
+                    await pool.query('DELETE FROM cliente_estado WHERE telefone = $1', [remoteJid]);
+                } else {
+                    await sock.sendMessage(remoteJid, { text: '❌ Serviço não encontrado. Por favor, digite o número correspondente da lista de serviços.' });
+                }
+            } 
+            else {
+                // Caso o estado esteja corrompido ou nulo, joga para o menu principal
+                etapaAtual = 'MENU_PRINCIPAL';
+                await pool.query(`
+                    INSERT INTO cliente_estado (telefone, etapa, dado_temporario) 
+                    VALUES ($1, $2, NULL) 
+                    ON CONFLICT (telefone) DO UPDATE SET etapa = $2, dado_temporario = NULL;
+                `, [remoteJid, etapaAtual]);
+
+                await sock.sendMessage(remoteJid, { 
+                    text: '👋 Olá! Para começar, digite *menu* para ver nossas opções.' 
+                });
+            }
+
+        } catch (err) {
+            console.error('Erro no processamento da mensagem:', err);
+            await sock.sendMessage(remoteJid, { text: 'Ocorreu um erro interno no sistema. Tente enviar *menu* novamente.' });
         }
     });
 }
 
 connectWhatsApp();
 
+cat << 'EOF' > whatsapp.js
+const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const { usePostgresAuthState } = require('./postgresAuthState');
+const { Pool } = require('pg');
+const qrcode = require('qrcode-terminal');
+const pino = require('pino');
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+async function inicializarBanco() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS cliente_estado (
+                telefone VARCHAR(50) PRIMARY KEY,
+                etapa VARCHAR(50) NOT NULL,
+                dado_temporario TEXT
+            );
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS servicos (
+                id SERIAL PRIMARY KEY,
+                nome VARCHAR(100) NOT NULL,
+                preco NUMERIC(10, 2) NOT NULL
+            );
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS agendamentos (
+                id SERIAL PRIMARY KEY,
+                cliente_telefone VARCHAR(50) NOT NULL,
+                servico_id INT NOT NULL,
+                data_hora VARCHAR(50) NOT NULL,
+                criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        const resServicos = await pool.query('SELECT COUNT(*) FROM servicos');
+        if (parseInt(resServicos.rows[0].count) === 0) {
+            await pool.query(`
+                INSERT INTO servicos (nome, preco) VALUES 
+                ('Corte de Cabelo', 40.00),
+                ('Barba', 30.00),
+                ('Corte + Barba', 60.00);
+            `);
+        }
+        console.log('Banco estruturado com sucesso!');
+    } catch (err) {
+        console.error('Erro ao inicializar o banco:', err);
+    }
+}
+
+async function connectWhatsApp() {
+    await inicializarBanco();
+    const { state, saveCreds } = await usePostgresAuthState();
+    const sock = makeWASocket({
+        auth: state,
+        logger: pino({ level: 'silent' })
+    });
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            console.log('Escaneie o QR Code abaixo:\n');
+            qrcode.generate(qr, { small: true });
+        }
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) connectWhatsApp();
+        } else if (connection === 'open') {
+            console.log('WhatsApp conectado!');
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const remoteJid = msg.key.remoteJid;
+        const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text;
+        if (!messageText) return;
+
+        const textoLimpo = messageText.toLowerCase().trim();
+
+        try {
+            let resEstado = await pool.query('SELECT etapa, dado_temporario FROM cliente_estado WHERE telefone = $1', [remoteJid]);
+            let etapaAtual = resEstado.rows.length > 0 ? resEstado.rows[0].etapa : 'INICIO';
+
+            const saudacoes = ['oi', 'olá', 'ola', 'menu', 'coé', 'coe', 'salve', 'e aí', 'e ai', 'fala', 'inicio'];
+            const ehSaudacao = saudacoes.some(girling => textoLimpo.includes(girling));
+
+            if (ehSaudacao || textoLimpo === 'menu') {
+                etapaAtual = 'MENU_PRINCIPAL';
+                await pool.query(`
+                    INSERT INTO cliente_estado (telefone, etapa, dado_temporario) 
+                    VALUES ($1, $2, NULL) 
+                    ON CONFLICT (telefone) DO UPDATE SET etapa = $2, dado_temporario = NULL;
+                `, [remoteJid, etapaAtual]);
+
+                await sock.sendMessage(remoteJid, { 
+                    text: '💈 *Sistema de Atendimento Inteligente*\n\nSeja bem-vindo! Como podemos ajudar?\n\n1️⃣ Ver Serviços e Agendar\n2️⃣ Falar com Atendente' 
+                });
+                return;
+            }
+
+            if (etapaAtual === 'MENU_PRINCIPAL') {
+                if (textoLimpo === '1') {
+                    const servicosRes = await pool.query('SELECT id, nome, preco FROM servicos ORDER BY id ASC');
+                    let textoServicos = '✂️ *Escolha o serviço desejado digitando o número:*\n\n';
+                    servicosRes.rows.forEach(s => {
+                        textoServicos += `${s.id}️⃣ ${s.nome} - R$ ${Number(s.preco).toFixed(2)}\n`;
+                    });
+
+                    etapaAtual = 'ESCOLHENDO_SERVICO';
+                    await pool.query('UPDATE cliente_estado SET etapa = $1 WHERE telefone = $2', [etapaAtual, remoteJid]);
+                    await sock.sendMessage(remoteJid, { text: textoServicos });
+                } else if (textoLimpo === '2') {
+                    await sock.sendMessage(remoteJid, { text: '📞 Um atendente foi chamado e responderá em breve.' });
+                    await pool.query('DELETE FROM cliente_estado WHERE telefone = $1', [remoteJid]);
+                } else {
+                    await sock.sendMessage(remoteJid, { text: '⚠️ Opção inválida. Digite *1* para serviços ou *2* para atendente.' });
+                }
+            } else if (etapaAtual === 'ESCOLHENDO_SERVICO') {
+                const servicoId = parseInt(textoLimpo);
+                const servicoRes = await pool.query('SELECT * FROM servicos WHERE id = $1', [servicoId]);
+
+                if (servicoRes.rows.length > 0) {
+                    const servicoEscolhido = servicoRes.rows[0].nome;
+                    const horarioFixo = 'Hoje às 17:00';
+
+                    await pool.query(
+                        'INSERT INTO agendamentos (cliente_telefone, servico_id, data_hora) VALUES ($1, $2, $3)',
+                        [remoteJid, servicoId, horarioFixo]
+                    );
+
+                    await sock.sendMessage(remoteJid, { 
+                        text: `✅ *Agendamento Confirmado!*\n\nServiço: ${servicoEscolhido}\nHorário: ${horarioFixo}\n\nObrigado!` 
+                    });
+                    await pool.query('DELETE FROM cliente_estado WHERE telefone = $1', [remoteJid]);
+                } else {
+                    await sock.sendMessage(remoteJid, { text: '❌ Serviço não encontrado. Digite o número correspondente da lista.' });
+                }
+            } else {
+                etapaAtual = 'MENU_PRINCIPAL';
+                await pool.query(`
+                    INSERT INTO cliente_estado (telefone, etapa, dado_temporario) 
+                    VALUES ($1, $2, NULL) 
+                    ON CONFLICT (telefone) DO UPDATE SET etapa = $2, dado_temporario = NULL;
+                `, [remoteJid, etapaAtual]);
+                await sock.sendMessage(remoteJid, { text: '👋 Olá! Digite *menu* para ver nossas opções.' });
+            }
+        } catch (err) {
+            console.error('Erro:', err);
+            await sock.sendMessage(remoteJid, { text: 'Ocorreu um erro interno. Envie *menu* novamente.' });
+        }
+    });
+}
+
+connectWhatsApp();
