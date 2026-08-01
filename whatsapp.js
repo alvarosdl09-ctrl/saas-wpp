@@ -1,7 +1,6 @@
 const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
 const { usePostgresAuthState } = require('./postgresAuthState');
 const { Pool } = require('pg');
-const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 
 const pool = new Pool({
@@ -57,17 +56,27 @@ async function connectWhatsApp() {
         logger: pino({ level: 'silent' })
     });
 
+    if (!sock.authState.creds.registered) {
+        const phoneNumber = "555198049420";
+        setTimeout(async () => {
+            try {
+                const code = await sock.requestPairingCode(phoneNumber);
+                console.log(`\n========================================`);
+                console.log(`🔑 SEU CÓDIGO DE PAREAMENTO: ${code}`);
+                console.log(`========================================\n`);
+            } catch (error) {
+                console.error('Erro ao gerar código de pareamento:', error);
+            }
+        }, 5000);
+    }
+
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) {
-            console.log('Escaneie o QR Code abaixo:\n');
-            qrcode.generate(qr, { small: true });
-        }
+        const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) connectWhatsApp();
         } else if (connection === 'open') {
-            console.log('WhatsApp conectado!');
+            console.log('WhatsApp conectado com sucesso!');
         }
     });
 
